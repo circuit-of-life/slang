@@ -13,10 +13,11 @@ jobs:
             matrix:
                 os: [linux, macos, windows]
                 config: [release]
-                platform: [x86_64, aarch64, wasm]
+                platform: [x86_64, aarch64]
                 exclude:
-                    - { os: windows, platform: wasm }
-                    - { os: macos, platform: wasm }
+                    - { os: linux, platform: aarch64 }
+                    - { os: windows, platform: aarch64 }
+                    - { os: macos, platform: x86_64 }
                 include:
                     - {
                           os: linux,
@@ -25,39 +26,11 @@ jobs:
                           compiler: gcc,
                       }
                     - {
-                          os: linux,
-                          platform: aarch64,
-                          runs-on: ubuntu-22.04-arm,
-                          compiler: gcc,
-                      }
-                    - {
-                          os: linux,
-                          platform: wasm,
-                          runs-on: ubuntu-22.04,
-                          compiler: gcc,
-                          build-slang-llvm: false,
-                      }
-                    - {
                           os: windows,
                           platform: x86_64,
                           arch: amd64,
                           runs-on: windows-latest,
                           compiler: cl,
-                      }
-                    - {
-                          os: windows,
-                          platform: aarch64,
-                          arch: amd64_arm64,
-                          runs-on: windows-latest,
-                          compiler: cl,
-                          extra-cmake-flags: "-DSLANG_ENABLE_CUDA=0",
-                      }
-                    - {
-                          os: macos,
-                          platform: x86_64,
-                          arch: x86_64,
-                          runs-on: macos-latest,
-                          compiler: clang,
                       }
                     - {
                           os: macos,
