@@ -31,6 +31,116 @@
 namespace Slang
 {
 
+// Return true if `loop` is a loop with an actual back edge, as opposed to a breakable region: an
+// `IRLoop` whose target block is only entered once, which the SPIR-V emitter writes as an
+// `OpSwitch` with a single default case.
+static bool isLoopWithBackEdge(IRLoop* loop)
+{
+    for (auto use = loop->getTargetBlock()->firstUse; use; use = use->nextUse)
+    {
+        if (use->getUser() != loop)
+            return true;
+    }
+    return false;
+}
+
+// Return true if a branch at the end of `fromBlock` to the continue block of `loop` is a valid
+// SPIR-V "continue": `fromBlock` is inside the body of `loop` and not inside a loop nested in it.
+// Selection constructs and breakable regions in between don't matter, because SPIR-V allows a
+// branch to the continue target of the innermost enclosing loop from inside those.
+static bool isContinueFromLoopBody(IRDominatorTree* dom, IRLoop* loop, IRBlock* fromBlock)
+{
+    auto header = as<IRBlock>(loop->getParent());
+    if (!dom->dominates(header, fromBlock) || dom->dominates(loop->getBreakBlock(), fromBlock))
+        return false;
+    for (auto block = dom->getImmediateDominator(fromBlock); block != header;
+         block = dom->getImmediateDominator(block))
+    {
+        auto innerLoop = as<IRLoop>(block->getTerminator());
+        if (innerLoop && isLoopWithBackEdge(innerLoop) &&
+            !dom->dominates(innerLoop->getBreakBlock(), fromBlock))
+            return false;
+    }
+    return true;
+}
+
+// Return true if the continue block of `loop` can be emitted directly as the `OpLoopMerge`
+// continue target, so that every `continue` in the loop stays a plain branch to it.
+//
+// Consider this example:
+//
+//     for (uint i = 0; i < n; i++)
+//     {
+//         if (skip(i))
+//             continue;
+//         work(i);
+//     }
+//
+// The continue block holds `i++` and branches back to the loop header. SPIR-V can express that
+// directly, the same way glslang compiles the loop. The alternative, `eliminateContinueBlocks`,
+// wraps the loop body in a breakable region (emitted as `OpSwitch`) and turns the `continue` into
+// a break out of it, which costs downstream compilers: Mesa, for example, lowers a switch case
+// that is exited early into an extra single-iteration loop with a flag variable per exit, and on
+// Intel GPUs this measurably increased register spilling in loop-heavy shaders.
+//
+// The direct form satisfies the SPIR-V structured control flow rules when the continue construct
+// is exactly the continue block (it branches straight to the loop header and is the only back
+// edge), when the block is not also the merge block of another construct, and when every branch
+// to it is a continue of this loop (see `isContinueFromLoopBody`).
+static bool canEmitContinueBlockDirectly(IRDominatorTree* dom, IRLoop* loop)
+{
+    auto targetBlock = loop->getTargetBlock();
+    auto continueBlock = loop->getContinueBlock();
+    if (!continueBlock || continueBlock == targetBlock)
+        return false;
+
+    auto backEdge = as<IRUnconditionalBranch>(continueBlock->getTerminator());
+    if (!backEdge || backEdge->getOp() != kIROp_UnconditionalBranch ||
+        backEdge->getTargetBlock() != targetBlock)
+        return false;
+    for (auto use = targetBlock->firstUse; use; use = use->nextUse)
+    {
+        if (use->getUser() != loop && use->getUser() != backEdge)
+            return false;
+    }
+
+    for (auto use = continueBlock->firstUse; use; use = use->nextUse)
+    {
+        auto user = use->getUser();
+        if (user == loop && use == &loop->continueBlock)
+            continue;
+        if (user->getOp() != kIROp_UnconditionalBranch)
+            return false;
+        auto fromBlock = as<IRBlock>(user->getParent());
+        if (!fromBlock || !isContinueFromLoopBody(dom, loop, fromBlock))
+            return false;
+    }
+    return true;
+}
+
+// Eliminate the continue blocks of the loops in `func` that can't be emitted directly as SPIR-V
+// continue targets (see `canEmitContinueBlockDirectly`). The decisions are all made on the
+// original control flow graph before any loop is rewritten; rewriting one loop only adds blocks
+// inside that loop, so it doesn't change the decision for any other loop.
+static void eliminateContinueBlocksForSPIRV(IRModule* module, IRFunc* func)
+{
+    // Post order visits inner loops first, the same order `eliminateContinueBlocksInFunc` uses.
+    List<IRLoop*> loopsToRewrite;
+    RefPtr<IRDominatorTree> dom;
+    for (auto block : getPostorder(func))
+    {
+        auto loop = as<IRLoop>(block->getTerminator());
+        if (!loop || loop->getContinueBlock() == loop->getTargetBlock())
+            continue;
+        if (!dom)
+            dom = computeDominatorTree(func);
+        if (!canEmitContinueBlockDirectly(dom, loop))
+            loopsToRewrite.add(loop);
+    }
+    for (auto loop : loopsToRewrite)
+        eliminateContinueBlocks(module, loop);
+}
+
 //
 // Legalization of IR for direct SPIRV emit.
 //
@@ -1588,9 +1698,10 @@ struct SPIRVLegalizationContext : public SourceEmitterBase
         //       - the back-edge block must structurally post dominate the
         //         Continue Target
 
-        // By this point, we should have already eliminated all continue jumps and
-        // turned them into a break jump. So all loop insts should satisfy
-        // continueBlock == targetBlock.
+        // By this point, `eliminateContinueBlocksForSPIRV` has either eliminated the
+        // continue block (continueBlock == targetBlock, handled below), or kept it because it
+        // already is a valid continue construct on its own (see
+        // `canEmitContinueBlockDirectly`), which needs no changes here.
         const auto t = loop->getTargetBlock();
         auto c = loop->getContinueBlock();
 
@@ -2503,7 +2614,7 @@ struct SPIRVLegalizationContext : public SourceEmitterBase
                 }
                 break;
             case kIROp_Func:
-                eliminateContinueBlocksInFunc(m_module, as<IRFunc>(inst));
+                eliminateContinueBlocksForSPIRV(m_module, as<IRFunc>(inst));
                 [[fallthrough]];
             default:
                 for (auto child = inst->getLastChild(); child; child = child->getPrevInst())
